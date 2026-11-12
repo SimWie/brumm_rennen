@@ -1,11 +1,11 @@
-import 'dart:async';
 import 'dart:math';
-import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
-import 'package:record/record.dart';
-import 'package:sensors_plus/sensors_plus.dart';
 
+import '../sensors/gas.dart';
+import '../sensors/steering.dart';
+
+/// Testseite: zeigt Lenkung und Gas live an, mit Reglern zum Einstellen.
 class SensorTestScreen extends StatefulWidget {
   const SensorTestScreen({super.key});
 
@@ -14,132 +14,134 @@ class SensorTestScreen extends StatefulWidget {
 }
 
 class _SensorTestScreenState extends State<SensorTestScreen> {
-  final Stream<AccelerometerEvent> _accelStream =
-      accelerometerEventStream(samplingPeriod: SensorInterval.gameInterval);
+  final Steering _steering = Steering();
+  final Gas _gas = Gas();
+  bool _micRunning = false;
+
+  @override
+  void dispose() {
+    _gas.dispose(); // Mikrofon aus, sonst läuft es weiter
+    super.dispose();
+  }
+
+  Future<void> _toggleMic() async {
+    if (_micRunning) {
+      await _gas.stop();
+      setState(() => _micRunning = false);
+    } else {
+      final ok = await _gas.start();
+      if (!ok && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Mikrofon-Berechtigung fehlt')),
+        );
+      }
+      setState(() => _micRunning = ok);
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text('Sensor-Test')),
       body: Padding(
-        padding: const EdgeInsets.all(24),
+        padding: const EdgeInsets.symmetric(horizontal: 24),
         child: Row(
           children: [
-            Expanded(child: _buildTilt()),
-            const SizedBox(width: 24),
-            Expanded(child: _buildMic()),
+            Expanded(child: _buildSteering()),
+            const VerticalDivider(width: 48),
+            Expanded(child: _buildGas()),
           ],
         ),
       ),
     );
   }
 
-  Widget _buildTilt() {
-    return StreamBuilder<AccelerometerEvent>(
-      stream: _accelStream,
+  // ---------- Lenkung ----------
+
+  Widget _buildSteering() {
+    final textTheme = Theme.of(context).textTheme;
+
+    return StreamBuilder<double>(
+      stream: _steering.steeringValue,
       builder: (context, snapshot) {
+        final steer = snapshot.data ?? 0; // −1.0 … +1.0
 
-        if (!snapshot.hasData) {
-          return const Center(child: Text('Warte auf Sensor …'));
-        }
-        
-        final e = snapshot.data!;
-        final angleDeg = atan2(e.y, e.x) * 180 / pi;
+        return SingleChildScrollView(
+          child: Column(
+            children: [
+              Text('Lenkung', style: textTheme.titleLarge),
+              Text(steer.toStringAsFixed(2), style: textTheme.displayMedium),
 
-        return Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
+              // Auto dreht sich mit, max. 45° bei vollem Einschlag
+              Transform.rotate(
+                angle: steer * pi / 4,
+                child: const Icon(Icons.navigation, size: 64),
+              ),
 
-            Transform.rotate(
-              angle: -angleDeg * pi / 180,
-              child: const Icon(Icons.directions_car, size: 80),
-            ),
+              // Balken von −1 (links) bis +1 (rechts), nur Anzeige
+              Slider(value: steer, min: -1, max: 1, onChanged: null),
 
-          ],
+              const SizedBox(height: 8),
+              Text('Empfindlichkeit: ${_steering.sensitivity.toStringAsFixed(2)}'),
+              Slider(
+                value: _steering.sensitivity,
+                onChanged: (s) => setState(() => _steering.setSteeringSensitivity(s)),
+              ),
+            ],
+          ),
         );
       },
     );
   }
 
+  // ---------- Gas ----------
 
-  final AudioRecorder _recorder = AudioRecorder();
-  StreamSubscription<Uint8List>? _micSub;
-  double _micLevel = 0;      // 0.0 – 1.0
-  bool _micRunning = false;
+  Widget _buildGas() {
+    final textTheme = Theme.of(context).textTheme;
 
-  Future<void> _startMic() async {
-    // Fragt beim ersten Mal den Benutzer um Erlaubnis
-    if (!await _recorder.hasPermission()) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Mikrofon-Berechtigung fehlt')),
+    return StreamBuilder<double>(
+      stream: _gas.gasValue,
+      builder: (context, snapshot) {
+        final gas = snapshot.data ?? 0; // 0.0 … 1.0
+
+        return SingleChildScrollView(
+          child: Column(
+            children: [
+              Text('Gas', style: textTheme.titleLarge),
+              Text(gas.toStringAsFixed(2), style: textTheme.displayMedium),
+              const SizedBox(height: 8),
+              LinearProgressIndicator(value: gas, minHeight: 20),
+              const SizedBox(height: 8),
+              Text('Rohpegel: ${_gas.lastLevel.toStringAsFixed(3)}   '
+                  'Rauschen: ${_gas.noiseFloor.toStringAsFixed(3)}'),
+
+              const SizedBox(height: 8),
+              Text('Verstärkung: ${_gas.boost.toStringAsFixed(1)}'),
+              Slider(
+                value: _gas.boost,
+                min: 1,
+                max: 15,
+                onChanged: (b) => setState(() => _gas.boost = b),
+              ),
+
+              Wrap(
+                spacing: 12,
+                children: [
+                  FilledButton.icon(
+                    onPressed: _toggleMic,
+                    icon: Icon(_micRunning ? Icons.mic_off : Icons.mic),
+                    label: Text(_micRunning ? 'Stopp' : 'Mikrofon starten'),
+                  ),
+                  OutlinedButton(
+                    onPressed: _micRunning ? () => setState(_gas.calibrate) : null,
+                    child: const Text('Kalibrieren (still sein!)'),
+                  ),
+                ],
+              ),
+            ],
+          ),
         );
-      }
-      return;
-    }
-
-    final stream = await _recorder.startStream(const RecordConfig(
-      encoder: AudioEncoder.pcm16bits, // rohe Samples, nicht komprimiert
-      sampleRate: 16000,
-      numChannels: 1,                  // Mono reicht
-    ));
-
-    _micSub = stream.listen((bytes) {
-      setState(() => _micLevel = _rms(bytes));
-    });
-    setState(() => _micRunning = true);
-  }
-
-  Future<void> _stopMic() async {
-    await _micSub?.cancel();
-    await _recorder.stop();
-    setState(() {
-      _micRunning = false;
-      _micLevel = 0;
-    });
-  }
-
-  /// Berechnet die Lautstärke (0.0–1.0) aus 16-Bit-PCM-Bytes
-  double _rms(Uint8List bytes) {
-    final data = ByteData.sublistView(bytes);
-    final sampleCount = bytes.length ~/ 2; // 2 Bytes pro Sample
-    if (sampleCount == 0) return 0;
-
-    double sum = 0;
-    for (var i = 0; i < sampleCount; i++) {
-      final s = data.getInt16(i * 2, Endian.little) / 32768.0;
-      sum += s * s;
-    }
-    return sqrt(sum / sampleCount);
-  }
-
-  @override
-  void dispose() {
-    // WICHTIG: alles aufräumen, sonst läuft das Mikrofon weiter
-    _micSub?.cancel();
-    _recorder.dispose();
-    super.dispose();
-  }
-
-  Widget _buildMic() {
-    return Column(
-      mainAxisAlignment: MainAxisAlignment.center,
-      children: [
-        Text('Gas (Mikrofon)', style: Theme.of(context).textTheme.titleLarge),
-        Text(_micLevel.toStringAsFixed(3),
-            style: Theme.of(context).textTheme.displayMedium),
-        const SizedBox(height: 16),
-        LinearProgressIndicator(
-          value: (_micLevel * 5).clamp(0.0, 1.0), // verstärkt, sonst kaum sichtbar
-          minHeight: 24,
-        ),
-        const SizedBox(height: 24),
-        FilledButton.icon(
-          onPressed: _micRunning ? _stopMic : _startMic,
-          icon: Icon(_micRunning ? Icons.mic_off : Icons.mic),
-          label: Text(_micRunning ? 'Stopp' : 'Mikrofon starten'),
-        ),
-      ],
+      },
     );
   }
 }
