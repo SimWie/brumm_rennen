@@ -6,7 +6,8 @@ plugins {
 
 android {
     namespace = "ch.hftm.brumm_rennen"
-    compileSdk = flutter.compileSdkVersion
+    // permission_handler_android verlangt compileSdk 37 (abwärtskompatibel, minSdk/targetSdk bleiben unverändert)
+    compileSdk = 37
     ndkVersion = flutter.ndkVersion
 
     compileOptions {
